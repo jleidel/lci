@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 The LCI Project Authors
+# SPDX-License-Identifier: NCSA
+#
+# Launch an LCI program across several hosts over ssh, bootstrapping with the
+# LCT TCP PMI backend (RANK / WORLD_SIZE / LCT_MASTER_ADDR / LCT_MASTER_PORT).
+# Intended for small clusters without a resource manager, e.g., Macs linked by
+# Thunderbolt 5 RDMA.
+#
+# Usage:
+#   lcrun-ssh -H host1,host2[,...] [-n ranks_per_host] [-a master_addr]
+#             [-p master_port] [-C workdir] -- <command> [args...]
+#
+# Rank r runs on host floor(r / ranks_per_host). The master address defaults
+# to the first host and must be reachable from every host (it is only used for
+# bootstrap; RDMA traffic uses the verbs device). Environment variables whose
+# names start with LCI_ or LCT_ are forwarded to every rank. The working
+# directory defaults to the current one and must exist on every host.
+#
+# Example (two Macs, one rank each, force the ibv backend):
+#   LCI_ATTR_BACKEND=ibv tools/lcrun-ssh -H mac1,mac2 -- \
+#       build/tests/unit/collective/lci_test_collective
+#
+# Written for bash 3.2 (the macOS system bash).
+
+set -u
+
+usage() {
+  sed -n '10,22p' "$0" | sed 's/^# \{0,1\}//' >&2
+  exit 1
+}
+
+hosts=""
+ppn=1
+master_addr=""
+master_port=29571
+workdir=$(pwd)
+
+while getopts "H:n:a:p:C:h" opt; do
+  case $opt in
+    H) hosts=$OPTARG ;;
+    n) ppn=$OPTARG ;;
+    a) master_addr=$OPTARG ;;
+    p) master_port=$OPTARG ;;
+    C) workdir=$OPTARG ;;
+    *) usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ "${1:-}" = "--" ] && shift
+[ -n "$hosts" ] && [ $# -gt 0 ] || usage
+
+IFS=',' read -r -a host_list <<< "$hosts"
+nhosts=${#host_list[@]}
+world_size=$((nhosts * ppn))
+[ -n "$master_addr" ] || master_addr=${host_list[0]}
+
+# Quote the command and forwarded variables for the remote shell.
+cmd=""
+for arg in "$@"; do
+  cmd+=" $(printf '%q' "$arg")"
+done
+fwd_env=""
+while IFS='=' read -r name _; do
+  case $name in
+    LCI_* | LCT_*) fwd_env+=" $name=$(printf '%q' "${!name}")" ;;
+  esac
+done < <(env)
+
+pids=()
+cleanup() {
+  for pid in "${pids[@]:-}"; do
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null
+  done
+}
+trap 'cleanup; exit 130' INT TERM
+
+rank=0
+for host in "${host_list[@]}"; do
+  for ((i = 0; i < ppn; i++)); do
+    remote="cd $(printf '%q' "$workdir") && env$fwd_env \
+LCT_PMI_BACKEND=tcp RANK=$rank WORLD_SIZE=$world_size \
+LCT_MASTER_ADDR=$(printf '%q' "$master_addr") LCT_MASTER_PORT=$master_port \
+$cmd"
+    # -tt is not used so that ranks do not compete for the terminal; output is
+    # prefixed with the rank instead.
+    (set -o pipefail
+     ssh -o BatchMode=yes "$host" "$remote" 2>&1 | sed "s/^/[$rank@$host] /") &
+    pids+=($!)
+    rank=$((rank + 1))
+  done
+done
+
+# Wait for all ranks; if one fails, terminate the others.
+status=0
+remaining=${#pids[@]}
+while [ "$remaining" -gt 0 ]; do
+  remaining=0
+  for idx in "${!pids[@]}"; do
+    pid=${pids[$idx]}
+    [ -n "$pid" ] || continue
+    if kill -0 "$pid" 2>/dev/null; then
+      remaining=$((remaining + 1))
+      continue
+    fi
+    wait "$pid"
+    rc=$?
+    pids[$idx]=""
+    if [ $rc -ne 0 ] && [ $status -eq 0 ]; then
+      status=$rc
+      echo "lcrun-ssh: rank $idx exited with status $rc; stopping the rest" >&2
+      cleanup
+    fi
+  done
+  [ "$remaining" -gt 0 ] && sleep 0.2
+done
+exit $status

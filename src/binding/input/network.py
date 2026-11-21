@@ -22,7 +22,10 @@ resource_net_context := resource(
         attr("std::string", "device_name", default_value="\"\"", comment="The network device name to use. For the IBV backend this is the verbs device name; for the OFI backend this is the libfabric domain name. Empty string selects the default/best available device."),
         attr_enum("ibv_odp_strategy", enum_options=["none", "explicit_odp", "implicit_odp"], default_value="none", comment="For the IBV backend: the on-demand paging strategy."),
         attr_enum("ibv_prefetch_strategy", enum_options=["none", "prefetch", "prefetch_write", "prefetch_no_fault"], default_value="none", comment="For the IBV backend: the mr prefetch strategy."),
+        attr_enum("ibv_qp_type", enum_options=["auto_select", "rc", "uc"], default_value="auto_select", comment="For the IBV backend: the queue pair transport. `auto_select` selects RC when the verbs library provides shared receive queues and UC otherwise (e.g., Apple RDMA over Thunderbolt). UC does not support get (RDMA read) and uses per-QP receive queues with credit-based flow control."),
+        attr("size_t", "ibv_recv_depth_per_qp", default_value=64, comment="For the IBV backend: the receive queue depth of each queue pair when shared receive queues are not used (UC transport)."),
         attr("bool", "support_putimm", inout_trait="out", comment="Whether the network context supports put with immediate data."),
+        attr("bool", "support_get", inout_trait="out", comment="Whether the network context supports get (RDMA read)."),
         attr("bool", "use_dmabuf", default_value=1, comment="Whether to use dmabuf for cuda buffer registration."),
     ],
     doc = {

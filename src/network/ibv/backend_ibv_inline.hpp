@@ -6,8 +6,10 @@
 
 namespace lci
 {
-inline void qp2rank_map_t::add_qps(const std::vector<struct ibv_qp*>& qps,
-                                   std::vector<padded_atomic_t<int>>* qp_slots)
+inline void qp2rank_map_t::add_qps(
+    const std::vector<struct ibv_qp*>& qps,
+    std::vector<padded_atomic_t<int>>* qp_slots,
+    std::vector<ibv_qp_recv_state_t>* recv_states)
 {
   if (qps.empty() || qp_slots == nullptr) return;
   std::unique_lock<std::shared_mutex> lock(mutex);
@@ -15,6 +17,7 @@ inline void qp2rank_map_t::add_qps(const std::vector<struct ibv_qp*>& qps,
     entry_t entry;
     entry.rank = static_cast<int>(i);
     entry.slots = &(*qp_slots)[i];
+    entry.recv_state = recv_states ? &(*recv_states)[i] : nullptr;
     qp_entries.emplace_back(qps[i]->qp_num, entry);
   }
   rebuild_locked();
@@ -112,13 +115,29 @@ inline size_t ibv_device_impl_t::poll_comp_impl(net_status_t* p_statuses,
   int ne = ibv_poll_cq(ib_cq, max_polls, wcs);
   cq_lock.unlock();
   LCI_Assert(ne >= 0, "ibv_poll_cq failed: %d\n", ne);
+  size_t nout = 0;
   if (ne > 0) {
     // Got an entry here
     auto snapshot = qp2rank_map.get_snapshot();
+    // Without an SRQ, receive completions return buffers to per-QP state.
+    if (!use_srq) srq_lock.lock();
     for (int i = 0; i < ne; i++) {
       qp2rank_map_t::entry_t entry = snapshot->get_entry(wcs[i].qp_num);
-      const bool is_receive = wcs[i].opcode == IBV_WC_RECV ||
-                              wcs[i].opcode == IBV_WC_RECV_RDMA_WITH_IMM;
+      bool is_receive = wcs[i].opcode == IBV_WC_RECV ||
+                        wcs[i].opcode == IBV_WC_RECV_RDMA_WITH_IMM;
+      if (entry.recv_state != nullptr) {
+        // wc.opcode is undefined for failed completions; per-QP receive
+        // queues complete in FIFO order, so match the head instead.
+        auto& posted = entry.recv_state->posted;
+        is_receive = wcs[i].wr_id != ibv_detail::credit_wr_id &&
+                     !posted.empty() && posted.front().wr_id == wcs[i].wr_id;
+        if (is_receive) {
+          posted.pop_front();
+          mark_hungry_locked(entry.recv_state);
+        }
+      }
+      const bool is_credit_update =
+          !is_receive && wcs[i].wr_id == ibv_detail::credit_wr_id;
       // A failed send-side completion still releases its SQ slot.
       if (!is_receive) {
         if (entry.rank >= 0 && entry.rank < get_rank_n() &&
@@ -135,13 +154,21 @@ inline size_t ibv_device_impl_t::poll_comp_impl(net_status_t* p_statuses,
               wcs[i].qp_num);
         }
       }
-      if (!p_statuses) continue;
-      net_status_t& status = p_statuses[i];
+      if (is_credit_update && wcs[i].status == IBV_WC_SUCCESS) {
+        // Internal operation; nothing to report.
+        continue;
+      }
+      if (!p_statuses) {
+        ++nout;
+        continue;
+      }
+      net_status_t& status = p_statuses[nout++];
       memset(&status, 0, sizeof(status));
       if (wcs[i].status != IBV_WC_SUCCESS) {
         status.opcode = net_opcode_t::ERROR;
         status.rank = is_receive ? -1 : entry.rank;
-        status.user_context = is_receive ? nullptr : (void*)wcs[i].wr_id;
+        status.user_context =
+            (is_receive || is_credit_update) ? nullptr : (void*)wcs[i].wr_id;
       } else if (wcs[i].opcode == IBV_WC_RECV) {
         status.opcode = net_opcode_t::RECV;
         status.user_context = (void*)wcs[i].wr_id;
@@ -166,8 +193,19 @@ inline size_t ibv_device_impl_t::poll_comp_impl(net_status_t* p_statuses,
         status.user_context = (void*)wcs[i].wr_id;
       }
     }
+    if (!use_srq) {
+      distribute_recvs_locked();
+      flush_pending_credits_locked();
+      srq_lock.unlock();
+    }
+  } else if (!use_srq && credit_pending_any.load(std::memory_order_relaxed)) {
+    // Retry credit updates that could not be posted earlier.
+    if (srq_lock.try_lock()) {
+      flush_pending_credits_locked();
+      srq_lock.unlock();
+    }
   }
-  return ne;
+  return nout;
 }
 
 namespace ibv_detail
@@ -194,7 +232,19 @@ inline error_t ibv_device_impl_t::post_recv_impl(void* buffer, size_t size,
   struct ibv_recv_wr* bad_wr;
 
   if (!srq_lock.try_lock()) return errorcode_t::retry_lock;
+  if (!use_srq) {
+    recv_stash.push_back(
+        ibv_recv_item_t{list.addr, list.length, list.lkey, wr.wr_id});
+    distribute_recvs_locked();
+    srq_lock.unlock();
+    return errorcode_t::done;
+  }
+#if LCI_IBV_HAVE_SRQ
   int ret = ibv_post_srq_recv(ib_srq, &wr, &bad_wr);
+#else
+  (void)bad_wr;
+  int ret = EINVAL;
+#endif
   srq_lock.unlock();
 
   if (ret == 0)
@@ -223,10 +273,26 @@ inline size_t ibv_device_impl_t::post_recvs_impl(void* buffers[], size_t size,
   size_t n_posted = 0;
 
   if (!srq_lock.try_lock()) return 0;
+  if (!use_srq) {
+    for (size_t i = 0; i < count; i++) {
+      recv_stash.push_back(ibv_recv_item_t{(uint64_t)buffers[i], list.length,
+                                           list.lkey,
+                                           (uint64_t)user_contexts[i]});
+    }
+    distribute_recvs_locked();
+    srq_lock.unlock();
+    return count;
+  }
+  error = 0;
   for (size_t i = 0; i < count; i++) {
     list.addr = (uint64_t)buffers[i];
     wr.wr_id = (uint64_t)user_contexts[i];
+#if LCI_IBV_HAVE_SRQ
     error = ibv_post_srq_recv(ib_srq, &wr, &bad_wr);
+#else
+    (void)bad_wr;
+    error = EINVAL;
+#endif
     if (error == 0) {
       ++n_posted;
     } else {
@@ -270,6 +336,26 @@ inline bool ibv_endpoint_impl_t::try_acquire_slot(int rank, bool high_priority)
 inline void ibv_endpoint_impl_t::release_slot(int rank)
 {
   qp_remaining_slots[rank].val.fetch_add(1, std::memory_order_relaxed);
+}
+
+inline bool ibv_endpoint_impl_t::try_acquire_credit(int rank)
+{
+  if (!p_ibv_device->use_credits) return true;
+  // credit_limits[rank] is advanced by the peer through RDMA write.
+  uint64_t limit = __atomic_load_n(&credit_limits[rank], __ATOMIC_ACQUIRE);
+  auto& consumed = credits_consumed[rank].val;
+  uint64_t cur = consumed.load(std::memory_order_relaxed);
+  do {
+    if (cur >= limit) return false;
+  } while (
+      !consumed.compare_exchange_weak(cur, cur + 1, std::memory_order_relaxed));
+  return true;
+}
+
+inline void ibv_endpoint_impl_t::release_credit(int rank)
+{
+  if (!p_ibv_device->use_credits) return;
+  credits_consumed[rank].val.fetch_sub(1, std::memory_order_relaxed);
 }
 
 inline bool ibv_endpoint_impl_t::try_lock_qp(int rank)
@@ -333,9 +419,14 @@ inline error_t ibv_endpoint_impl_t::post_sends_impl(int rank, void* buffer,
   if (!try_acquire_slot(rank, high_priority)) {
     return errorcode_t::retry_nomem;
   }
+  if (!try_acquire_credit(rank)) {
+    release_slot(rank);
+    return errorcode_t::retry_nomem;
+  }
   struct ibv_send_wr* bad_wr;
   if (!try_lock_qp(rank)) {
     release_slot(rank);
+    release_credit(rank);
     return errorcode_t::retry_lock;
   }
   int ret = ibv_post_send(ib_qps[rank], &wr, &bad_wr);
@@ -344,9 +435,11 @@ inline error_t ibv_endpoint_impl_t::post_sends_impl(int rank, void* buffer,
     return errorcode_t::done;
   } else if (ret == ENOMEM) {
     release_slot(rank);
+    release_credit(rank);
     return errorcode_t::retry_nomem;  // exceed send queue capacity
   } else {
     release_slot(rank);
+    release_credit(rank);
     IBV_SAFECALL_RET(ret);
   }
 }
@@ -381,9 +474,14 @@ inline error_t ibv_endpoint_impl_t::post_send_impl(int rank, void* buffer,
   if (!try_acquire_slot(rank, high_priority)) {
     return errorcode_t::retry_nomem;
   }
+  if (!try_acquire_credit(rank)) {
+    release_slot(rank);
+    return errorcode_t::retry_nomem;
+  }
   struct ibv_send_wr* bad_wr;
   if (!try_lock_qp(rank)) {
     release_slot(rank);
+    release_credit(rank);
     return errorcode_t::retry_lock;
   }
   int ret = ibv_post_send(ib_qps[rank], &wr, &bad_wr);
@@ -392,9 +490,11 @@ inline error_t ibv_endpoint_impl_t::post_send_impl(int rank, void* buffer,
     return errorcode_t::posted;
   else if (ret == ENOMEM) {
     release_slot(rank);
+    release_credit(rank);
     return errorcode_t::retry_nomem;  // exceed send queue capacity
   } else {
     release_slot(rank);
+    release_credit(rank);
     IBV_SAFECALL_RET(ret);
   }
 }
@@ -537,9 +637,14 @@ inline error_t ibv_endpoint_impl_t::post_putImms_impl(
   if (!try_acquire_slot(rank, high_priority)) {
     return errorcode_t::retry_nomem;
   }
+  if (!try_acquire_credit(rank)) {
+    release_slot(rank);
+    return errorcode_t::retry_nomem;
+  }
   struct ibv_send_wr* bad_wr;
   if (!try_lock_qp(rank)) {
     release_slot(rank);
+    release_credit(rank);
     return errorcode_t::retry_lock;
   }
   int ret = ibv_post_send(ib_qps[rank], &wr, &bad_wr);
@@ -548,9 +653,11 @@ inline error_t ibv_endpoint_impl_t::post_putImms_impl(
     return errorcode_t::done;
   else if (ret == ENOMEM) {
     release_slot(rank);
+    release_credit(rank);
     return errorcode_t::retry_nomem;  // exceed send queue capacity
   } else {
     release_slot(rank);
+    release_credit(rank);
     IBV_SAFECALL_RET(ret);
   }
 }
@@ -585,9 +692,14 @@ inline error_t ibv_endpoint_impl_t::post_putImm_impl(
   if (!try_acquire_slot(rank, high_priority)) {
     return errorcode_t::retry_nomem;
   }
+  if (!try_acquire_credit(rank)) {
+    release_slot(rank);
+    return errorcode_t::retry_nomem;
+  }
   struct ibv_send_wr* bad_wr;
   if (!try_lock_qp(rank)) {
     release_slot(rank);
+    release_credit(rank);
     return errorcode_t::retry_lock;
   }
   int ret = ibv_post_send(ib_qps[rank], &wr, &bad_wr);
@@ -596,9 +708,11 @@ inline error_t ibv_endpoint_impl_t::post_putImm_impl(
     return errorcode_t::posted;
   else if (ret == ENOMEM) {
     release_slot(rank);
+    release_credit(rank);
     return errorcode_t::retry_nomem;  // exceed send queue capacity
   } else {
     release_slot(rank);
+    release_credit(rank);
     IBV_SAFECALL_RET(ret);
   }
 }
@@ -610,6 +724,12 @@ inline error_t ibv_endpoint_impl_t::post_get_impl(int rank, void* buffer,
                                                   void* user_context,
                                                   bool high_priority)
 {
+  if (!net_context_attr.support_get) {
+    LCI_Assert(false,
+               "get (RDMA read) is not supported by the IBV UC transport. "
+               "Use LCI_ATTR_IBV_QP_TYPE=rc if the device supports RC.\n");
+    return errorcode_t::fatal;
+  }
   struct ibv_sge list;
   struct ibv_send_wr wr;
   if (LCT_likely(size > 0)) {

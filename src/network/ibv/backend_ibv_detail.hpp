@@ -5,11 +5,27 @@
 #define LCISI_IBV_DETAIL_H_
 #include "infiniband/verbs.h"
 #include <stdbool.h>
+#include <stdint.h>
+
+#ifndef LCI_IBV_HAVE_LINK_LAYER_THUNDERBOLT
+#error "lci_config.hpp must be included before backend_ibv_detail.hpp"
+#endif
 
 namespace lci
 {
 namespace ibv_detail
 {
+// Whether ports with this link layer are addressed by GID (RoCE, Thunderbolt)
+// rather than by LID (InfiniBand).
+inline bool is_gid_addressed_link_layer(uint8_t link_layer)
+{
+  if (link_layer == IBV_LINK_LAYER_ETHERNET) return true;
+#if LCI_IBV_HAVE_LINK_LAYER_THUNDERBOLT
+  if (link_layer == IBV_LINK_LAYER_THUNDERBOLT) return true;
+#endif
+  return false;
+}
+
 bool select_best_device_port(struct ibv_device** dev_list, int num_devices,
                              const char* requested_device_name,
                              struct ibv_device** device_o, uint8_t* port_o);

@@ -214,6 +214,7 @@ ofi_net_context_impl_t::ofi_net_context_impl_t(runtime_t runtime_, attr_t attr_)
         "warning by `export LCI_MAX_SINGLE_MESSAGE_SIZE=%lu`\n",
         attr.max_msg_size, attr.max_msg_size);
   }
+  attr.support_get = true;
   // Check put with immediate support.
   attr.support_putimm = true;
   std::string prov_name = ofi_info->fabric_attr->prov_name;

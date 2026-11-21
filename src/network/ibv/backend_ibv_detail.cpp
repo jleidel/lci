@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: NCSA
 
 #include "lci_internal.hpp"
+#include "network/ibv/backend_ibv_detail.hpp"
+#include <arpa/inet.h>
 
 namespace lci
 {
@@ -131,8 +133,9 @@ bool select_best_device_port(struct ibv_device** dev_list, int num_devices,
         LCI_Log(LOG_INFO, "ibv", "Couldn't get local LID\n");
         continue;
       }
-      // RoCE needs a GID (e.g., RDMA-disabled Ethernet VFs have none)
-      if (port_attr.link_layer == IBV_LINK_LAYER_ETHERNET &&
+      // RoCE/Thunderbolt need a GID (e.g., RDMA-disabled Ethernet VFs have
+      // none)
+      if (is_gid_addressed_link_layer(port_attr.link_layer) &&
           !has_valid_gid(dev_ctx, port_num, port_attr)) {
         LCI_Log(LOG_INFO, "ibv", "%s:%d has no valid GID.\n", device_name,
                 port_num);
@@ -140,12 +143,26 @@ bool select_best_device_port(struct ibv_device** dev_list, int num_devices,
       }
       // Calculate its speed
       int width = translate_width(port_attr.active_width);
+      double speed = translate_speed(port_attr.active_speed);
+#if LCI_IBV_HAVE_LINK_LAYER_THUNDERBOLT
+      if (port_attr.link_layer == IBV_LINK_LAYER_THUNDERBOLT &&
+          (width <= 0 || speed <= 0)) {
+        // Thunderbolt ports may not report IB-style width/speed encodings.
+        // Rank them by a nominal Thunderbolt 5 rate (80 Gbps).
+        LCI_Log(LOG_INFO, "ibv",
+                "%s:%d Thunderbolt port reports width %d speed %d; assume 80 "
+                "Gbps.\n",
+                device_name, port_num, port_attr.active_width,
+                port_attr.active_speed);
+        width = 1;
+        speed = 80;
+      }
+#endif
       if (width <= 0) {
         LCI_Log(LOG_INFO, "ibv", "%s:%d invalid width %d (%d).\n", device_name,
                 port_num, width, port_attr.active_width);
         continue;
       }
-      double speed = translate_speed(port_attr.active_speed);
       if (speed <= 0) {
         LCI_Log(LOG_INFO, "ibv", "%s:%d invalid speed %f (%d).\n", device_name,
                 port_num, speed, port_attr.active_width);
@@ -205,8 +222,26 @@ roce_version_t query_gid_roce_version(struct ibv_device* ib_dev,
   int ret;
   const char* dev_name = ibv_get_device_name(ib_dev);
 
+  buf[0] = '\0';
   union ibv_gid gid;
   ret = ibv_query_gid(dev_ctx, dev_port, gid_index, &gid);
+#if LCI_IBV_HAVE_QUERY_GID_EX
+  if (ret == 0) {
+    // Prefer the verbs API; it also works where sysfs does not exist (macOS).
+    struct ibv_gid_entry entry;
+    if (ibv_query_gid_ex(dev_ctx, dev_port, gid_index, &entry, 0) == 0) {
+      if (entry.gid_type == IBV_GID_TYPE_ROCE_V2) {
+        LCI_Log(LOG_DEBUG, "ibv", "dev %s port %d index %d uses Roce v2\n",
+                dev_name, dev_port, gid_index);
+        return ROCE_V2;
+      } else if (entry.gid_type == IBV_GID_TYPE_ROCE_V1) {
+        LCI_Log(LOG_DEBUG, "ibv", "dev %s port %d index %d uses IB/Roce v1\n",
+                dev_name, dev_port, gid_index);
+        return ROCE_V1;
+      }
+    }
+  }
+#endif
   if (ret == 0) {
     ret = LCT_read_file(buf, sizeof(buf),
                         "/sys/class/infiniband/%s/ports/%d/gid_attrs/types/%d",
@@ -311,8 +346,8 @@ void gid_to_wire_gid(const union ibv_gid* gid, char wgid[])
 
   memcpy(tmp_gid, gid, sizeof(tmp_gid));
   // FIXME: remove snprintf
-  for (i = 0; i < 4; ++i)
-    snprintf(&wgid[i * 8], 9, "%08x", htobe32(tmp_gid[i]));
+  // The wire format is the GID in network byte order, as 4 hex words.
+  for (i = 0; i < 4; ++i) snprintf(&wgid[i * 8], 9, "%08x", htonl(tmp_gid[i]));
 }
 
 void wire_gid_to_gid(const char* wgid, union ibv_gid* gid)
@@ -320,7 +355,7 @@ void wire_gid_to_gid(const char* wgid, union ibv_gid* gid)
   LCI_Assert(sizeof(union ibv_gid) == 16, "Unexpected ibv_gid size %d\n",
              sizeof(union ibv_gid));
   char tmp[9];
-  __be32 v32;
+  uint32_t v32;
   int i;
   uint32_t tmp_gid[4];
 
@@ -329,7 +364,7 @@ void wire_gid_to_gid(const char* wgid, union ibv_gid* gid)
     int ret = sscanf(tmp, "%x", &v32);
     LCI_Assert(ret == 1, "Failed to parse GID component %d from '%s'\n", i,
                tmp);
-    tmp_gid[i] = be32toh(v32);
+    tmp_gid[i] = ntohl(v32);
   }
   memcpy(gid, tmp_gid, sizeof(*gid));
 }

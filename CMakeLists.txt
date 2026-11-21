@@ -168,6 +168,87 @@ if(NOT LCI_WITH_LCT_ONLY)
     message(FATAL_ERROR "Cannot find any backends. Give up!")
   endif()
 
+  # Probe optional libibverbs features. rdma-core on Linux has all of them;
+  # Apple's libibverbs (RDMA over Thunderbolt) exposes a reduced verbs API.
+  if(LCI_BACKEND_ENABLE_IBV)
+    include(CheckCXXSourceCompiles)
+    include(CMakePushCheckState)
+    cmake_push_check_state(RESET)
+    set(CMAKE_REQUIRED_INCLUDES ${IBV_INCLUDE_DIRS})
+    set(CMAKE_REQUIRED_LIBRARIES ${IBV_LIBRARIES})
+    set(CMAKE_REQUIRED_QUIET ON)
+    check_cxx_source_compiles(
+      "#include <infiniband/verbs.h>
+      int main() {
+        struct ibv_srq_init_attr a{};
+        struct ibv_srq* s = ibv_create_srq(nullptr, &a);
+        struct ibv_recv_wr* bad;
+        ibv_post_srq_recv(s, nullptr, &bad);
+        return ibv_destroy_srq(s);
+      }"
+      LCI_IBV_HAVE_SRQ)
+    check_cxx_source_compiles(
+      "#include <infiniband/verbs.h>
+      int main() {
+        struct ibv_td_init_attr ta{};
+        struct ibv_td* td = ibv_alloc_td(nullptr, &ta);
+        struct ibv_parent_domain_init_attr pa{};
+        pa.td = td;
+        struct ibv_pd* pd = ibv_alloc_parent_domain(nullptr, &pa);
+        (void)pd;
+        return ibv_dealloc_td(td);
+      }"
+      LCI_IBV_HAVE_TD)
+    check_cxx_source_compiles(
+      "#include <infiniband/verbs.h>
+      int main() {
+        struct ibv_sge sge{};
+        return ibv_advise_mr(nullptr, IBV_ADVISE_MR_ADVICE_PREFETCH, 0, &sge, 1);
+      }"
+      LCI_IBV_HAVE_ADVISE_MR)
+    check_cxx_source_compiles(
+      "#include <infiniband/verbs.h>
+      int main() {
+        return ibv_reg_dmabuf_mr(nullptr, 0, 0, 0, 0, 0) != nullptr;
+      }"
+      LCI_IBV_HAVE_DMABUF_MR)
+    check_cxx_source_compiles(
+      "#include <infiniband/verbs.h>
+      int main() {
+        return IBV_ODP_SUPPORT_SEND | IBV_ODP_SUPPORT_RECV |
+               IBV_ODP_SUPPORT_WRITE | IBV_ODP_SUPPORT_READ |
+               IBV_ODP_SUPPORT_SRQ_RECV;
+      }"
+      LCI_IBV_HAVE_ODP_TRANSPORT_CAPS)
+    check_cxx_source_compiles(
+      "#include <infiniband/verbs.h>
+      int main() {
+        struct ibv_gid_entry e{};
+        return ibv_query_gid_ex(nullptr, 1, 0, &e, 0) + (e.gid_type == IBV_GID_TYPE_ROCE_V2);
+      }"
+      LCI_IBV_HAVE_QUERY_GID_EX)
+    check_cxx_source_compiles(
+      "#include <infiniband/verbs.h>
+      int main() { return IBV_LINK_LAYER_THUNDERBOLT; }"
+      LCI_IBV_HAVE_LINK_LAYER_THUNDERBOLT)
+    cmake_pop_check_state()
+    foreach(
+      _feat
+      SRQ
+      TD
+      ADVISE_MR
+      DMABUF_MR
+      ODP_TRANSPORT_CAPS
+      QUERY_GID_EX
+      LINK_LAYER_THUNDERBOLT)
+      if(LCI_IBV_HAVE_${_feat})
+        message(STATUS "libibverbs feature ${_feat}: yes")
+      else()
+        message(STATUS "libibverbs feature ${_feat}: no")
+      endif()
+    endforeach()
+  endif()
+
   # ############################################################################
   # LCI Optimization Options
   # ############################################################################

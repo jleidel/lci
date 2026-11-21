@@ -69,8 +69,10 @@ net_context_t alloc_net_context_x::call_impl(
     attr_backend_t backend, std::string ofi_provider_name, size_t max_msg_size,
     size_t max_inject_size, int ibv_gid_idx, bool ibv_force_gid_auto_select,
     std::string device_name, attr_ibv_odp_strategy_t ibv_odp_strategy,
-    attr_ibv_prefetch_strategy_t ibv_prefetch_strategy, bool use_dmabuf,
-    const char* name, void* user_context, runtime_t runtime) const
+    attr_ibv_prefetch_strategy_t ibv_prefetch_strategy,
+    attr_ibv_qp_type_t ibv_qp_type, size_t ibv_recv_depth_per_qp,
+    bool use_dmabuf, const char* name, void* user_context,
+    runtime_t runtime) const
 {
   net_context_t::attr_t attr;
   attr.backend = backend;
@@ -82,6 +84,8 @@ net_context_t alloc_net_context_x::call_impl(
   attr.device_name = device_name;
   attr.ibv_odp_strategy = ibv_odp_strategy;
   attr.ibv_prefetch_strategy = ibv_prefetch_strategy;
+  attr.ibv_qp_type = ibv_qp_type;
+  attr.ibv_recv_depth_per_qp = ibv_recv_depth_per_qp;
   attr.use_dmabuf = use_dmabuf;
   attr.name = name;
   attr.user_context = user_context;
